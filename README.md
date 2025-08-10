@@ -35,6 +35,7 @@ This project demonstrates how to build a RESTful API with authentication and use
 
 - Python 3.9 or higher
 - AWS credentials configured (for DynamoDB access)
+- Create table users, todos in dynamodb
 - DynamoDB table created with necessary indexes (`username-index`, `email-index`)
 
 ### Installation
