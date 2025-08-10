@@ -38,32 +38,37 @@ async def create_user(user: UserCreate):
     user_id = generate_user_id()
 
     user_item = {
-        "id": user_id,
-        "username": user.username,
-        "email": user.email,
-        "hashed_password": hashed_password,
-        "role": "user"
+        "id": {"S": user_id},
+        "username": {"S": user.username},
+        "email": {"S": user.email},
+        "hashed_password": {"S": hashed_password},
+        "role": {"S": user.role if user.role else "user"}  # <-- allow admin/user
     }
 
-    async with get_dynamodb_client() as table:
-        await table.put_item(Item=user_item)
+    async with get_dynamodb_client() as client:
+        await client.put_item(TableName=USERS_TABLE, Item=user_item)
 
     return {"message": "User created successfully", "user_id": user_id}
 
+
 async def existing_user(username: str, email: str):
-    async with get_dynamodb_client() as table:
+    async with get_dynamodb_client() as client:
         # Query username-index
-        response_username = await table.query(
+        response_username = await client.query(
+            TableName=USERS_TABLE,
             IndexName="username-index",
-            KeyConditionExpression=Key("username").eq(username)
+            KeyConditionExpression="username = :username",
+            ExpressionAttributeValues={":username": {"S": username}}
         )
         if response_username.get("Items"):
             return response_username["Items"][0]
 
         # Query email-index
-        response_email = await table.query(
+        response_email = await client.query(
+            TableName=USERS_TABLE,
             IndexName="email-index",
-            KeyConditionExpression=Key("email").eq(email)
+            KeyConditionExpression="email = :email",
+            ExpressionAttributeValues={":email": {"S": email}}
         )
         if response_email.get("Items"):
             return response_email["Items"][0]
@@ -90,11 +95,58 @@ async def authenticate(username: str, password: str):
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=EXPIRE_MINUTES)
-    to_encode.update({"exp": int(expire.timestamp())})
+    to_encode.update({
+        "exp": int(expire.timestamp()),
+        "role": data.get("role")  # include role in token
+    })
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+
+def deserialize_dynamodb_item(item):
+    # simple helper to convert DynamoDB attribute values to plain dict
+    return {k: list(v.values())[0] for k, v in item.items()}
+
 async def get_current_user(token: str = Depends(oauth2_bearer)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("user_id")
+        username: str = payload.get("sub")
+        exp = payload.get("exp")
+
+        if datetime.utcnow().timestamp() > exp:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token expired"
+            )
+        if user_id is None or username is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+
+        async with get_dynamodb_client() as table:
+            response = await table.get_item(
+                TableName=USERS_TABLE,
+                Key={"id": {"S": user_id}}
+            )
+
+            item = response.get("Item")
+            if not item:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User not found"
+                )
+
+            user = deserialize_dynamodb_item(item)
+            return user  # keep role from DynamoDB, not JWT
+
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("user_id")
@@ -108,17 +160,24 @@ async def get_current_user(token: str = Depends(oauth2_bearer)):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
         async with get_dynamodb_client() as table:
-            response = await table.get_item(Key={"id": user_id})
-            user = response.get("Item")
-            if not user:
+            response = await table.get_item(
+                TableName=USERS_TABLE,
+                Key={"id": {"S": user_id}}
+            )
+
+            item = response.get("Item")
+            if not item:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-            user["role"] = role
+
+            user = deserialize_dynamodb_item(item)
+            user["role"] = role  # you can override from token or keep from DynamoDB if stored there
             return user
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 def RoleChecker(allowed_roles: list[str]):
     async def checker(current_user=Security(get_current_user)):
+        print("User role:", current_user.get('role'))
         if current_user.get('role') not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -126,3 +185,5 @@ def RoleChecker(allowed_roles: list[str]):
             )
         return current_user
     return checker
+
+
