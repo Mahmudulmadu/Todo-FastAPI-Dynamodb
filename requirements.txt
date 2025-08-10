@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+aioboto3
+passlib[bcrypt]
+python-jose[cryptography]
+pydantic
+mangum
